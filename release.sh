@@ -380,6 +380,11 @@ validate_release() {
             return 1
         fi
     done
+    if [[ "$target" == *-w64-mingw32 ]] &&
+       [[ ! -x "$release_dir/bin/clang-as.exe" ]]; then
+        echo "Error: required Windows driver alias clang-as is missing from $release_dir/bin" >&2
+        return 1
+    fi
 
     actual_version="$("$release_dir/bin/llvm-config$exe_suffix" --version)"
     if [[ "$actual_version" != "$LLVM_EXPECTED_VERSION"* ]]; then
@@ -471,10 +476,10 @@ schedule_region_smoke_test:
         ret
         .end schedule
 EOF
-    if ! "$release_dir/bin/clang$exe_suffix" --target=xtensa -c \
+    if ! "$release_dir/bin/clang++$exe_suffix" --target=xtensa -c \
         "$test_dir/schedule-region.S" -o "$test_dir/schedule-region.o"; then
         rm -rf "$test_dir"
-        echo "Error: Xtensa assembler does not accept schedule regions" >&2
+        echo "Error: the Clang C++ driver cannot execute the Xtensa assembler" >&2
         return 1
     fi
 
@@ -571,12 +576,20 @@ build_windows_platform() {
         echo "Error: packaged Windows toolchain is missing $release_dir" >&2
         return 1
     fi
+
+    # The pinned Espressif packaging script removes unlisted Windows symlinks.
+    # LLVM 22's clang++ driver re-executes itself through the clang-as alias for
+    # assembler input, so preserve that alias as a regular PE executable just
+    # like the script already does for clang++ and clang-cpp.
+    if [[ ! -f "$release_dir/bin/clang-as.exe" ]]; then
+        cp "$release_dir/bin/clang.exe" "$release_dir/bin/clang-as.exe"
+    fi
     write_payload_manifest "$release_dir" "$target"
     install_payload_licenses "$release_dir"
 
     # Cross-built PE executables cannot run on the Linux builder. Check the
     # complete archive on a native Windows runner before it can be released.
-    for tool in clang clang++ ld.lld lld llvm-ar llvm-config llvm-nm llc opt; do
+    for tool in clang clang++ clang-as ld.lld lld llvm-ar llvm-config llvm-nm llc opt; do
         [[ -f "$release_dir/bin/$tool.exe" ]] || {
             echo "Error: required Windows tool $tool.exe is missing" >&2
             return 1
