@@ -19,6 +19,10 @@ LLVM_EXPECTED_VERSION="${LLVM_EXPECTED_VERSION:-$ESP_LLVM_EXPECTED_VERSION}"
 LLVM_EXPECTED_MAJOR="${LLVM_EXPECTED_VERSION%%.*}"
 LLVM_SOURCE_REVISION=""
 LLVM_SOURCE_PATCH_SHA256=""
+# The pinned Espressif build scripts omit opt from their default Toolchain
+# distribution. LLGo needs it for IR verification and pass-plugin smoke tests,
+# so keep the upstream component set and add opt to the packaged payload.
+WINDOWS_DISTRIBUTION_COMPONENTS="clang-format;clang-resource-headers;clang-tidy;clang;clangd;dsymutil;llc;lld;llvm-ar;llvm-config;llvm-cov;llvm-cxxfilt;llvm-dwarfdump;llvm-nm;llvm-objcopy;llvm-objdump;llvm-profdata;llvm-ranlib;llvm-readelf;llvm-readobj;llvm-size;llvm-strings;llvm-strip;llvm-symbolizer;LTO;opt"
 
 # Resolve source and build roots before changing into the per-platform build
 # directory. This keeps local qualification builds isolated from the checkout
@@ -509,6 +513,7 @@ build_windows_platform() {
         -DLLVM_TOOLCHAIN_CROSS_BUILD_MINGW=ON \
         -DLLVM_TOOLCHAIN_HOST_TRIPLE="$target" \
         '-DLLVM_TOOLCHAIN_ENABLED_TARGETS=RISCV;Xtensa' \
+        -DLLVM_Toolchain_DISTRIBUTION_COMPONENTS="$WINDOWS_DISTRIBUTION_COMPONENTS" \
         -DLLVM_TOOLCHAIN_PACKAGE_NAME=esp-clang \
         -DESP_TOOLCHAIN_VER="esp-$VERSION_STRING" \
         -DCLANG_REPOSITORY_STRING=https://github.com/espressif/llvm-project.git \
