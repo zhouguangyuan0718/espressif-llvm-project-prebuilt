@@ -406,14 +406,33 @@ validate_release() {
         fi
     done
 
-    [[ -f "$release_dir/include/llvm-c/Core.h" ]] || {
-        echo "Error: llvm-c/Core.h is missing" >&2
-        return 1
-    }
-    [[ -f "$release_dir/lib/cmake/llvm/LLVMConfig.cmake" ]] || {
-        echo "Error: LLVMConfig.cmake is missing" >&2
-        return 1
-    }
+    if [[ "$target" == *-w64-mingw32 ]]; then
+        # Espressif's MinGW distribution is an executable target toolchain,
+        # not the LLVM development SDK used to build LLGo's Go bindings. Its
+        # pinned component set intentionally installs only the public LTO
+        # interface, rather than llvm-headers and LLVM CMake package files.
+        [[ -f "$release_dir/include/llvm-c/lto.h" ]] || {
+            echo "Error: LLVM LTO header is missing from Windows payload" >&2
+            return 1
+        }
+        [[ -f "$release_dir/bin/libLTO.dll" ]] || {
+            echo "Error: LLVM LTO DLL is missing from Windows payload" >&2
+            return 1
+        }
+        [[ -f "$release_dir/lib/libLTO.dll.a" ]] || {
+            echo "Error: LLVM LTO import library is missing from Windows payload" >&2
+            return 1
+        }
+    else
+        [[ -f "$release_dir/include/llvm-c/Core.h" ]] || {
+            echo "Error: llvm-c/Core.h is missing" >&2
+            return 1
+        }
+        [[ -f "$release_dir/lib/cmake/llvm/LLVMConfig.cmake" ]] || {
+            echo "Error: LLVMConfig.cmake is missing" >&2
+            return 1
+        }
+    fi
     [[ -f "$release_dir/THIRD-PARTY-LICENSES.txt" ]] || {
         echo "Error: third-party license summary is missing" >&2
         return 1
@@ -424,15 +443,8 @@ validate_release() {
             return 1
         }
     done
-    if [[ "$target" == *-w64-mingw32 ]]; then
-        # MinGW LLVM uses an unversioned DLL name, unlike ELF/Mach-O packages.
-        # Accept either GNU's lib prefix or LLVM's native Windows spelling.
-        if ! find "$release_dir/lib" "$release_dir/bin" -maxdepth 1 \
-            \( -name 'libLLVM*.dll' -o -name 'LLVM*.dll' \) -print -quit | grep -q .; then
-            echo "Error: LLVM shared library DLL is missing" >&2
-            return 1
-        fi
-    elif ! find "$release_dir/lib" -maxdepth 1 -name "libLLVM-$LLVM_EXPECTED_MAJOR.*" -print -quit | grep -q .; then
+    if [[ "$target" != *-w64-mingw32 ]] &&
+       ! find "$release_dir/lib" -maxdepth 1 -name "libLLVM-$LLVM_EXPECTED_MAJOR.*" -print -quit | grep -q .; then
         echo "Error: libLLVM-$LLVM_EXPECTED_MAJOR shared library is missing" >&2
         return 1
     fi
@@ -570,8 +582,16 @@ build_windows_platform() {
             return 1
         }
     done
-    [[ -f "$release_dir/include/llvm-c/Core.h" ]] || {
-        echo "Error: llvm-c/Core.h is missing from Windows payload" >&2
+    [[ -f "$release_dir/include/llvm-c/lto.h" ]] || {
+        echo "Error: LLVM LTO header is missing from Windows payload" >&2
+        return 1
+    }
+    [[ -f "$release_dir/bin/libLTO.dll" ]] || {
+        echo "Error: LLVM LTO DLL is missing from Windows payload" >&2
+        return 1
+    }
+    [[ -f "$release_dir/lib/libLTO.dll.a" ]] || {
+        echo "Error: LLVM LTO import library is missing from Windows payload" >&2
         return 1
     }
     [[ -f "$release_dir/third-party-licenses/COPYING.MinGW-w64-runtime.txt" ]] || {
