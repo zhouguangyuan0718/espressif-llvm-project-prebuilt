@@ -360,6 +360,27 @@ EOF
         echo "Error: Xtensa assembler does not accept schedule regions" >&2
         return 1
     fi
+
+    cat > "$test_dir/codegen.c" << 'EOF'
+int llgo_esp_codegen_smoke(int a, int b) { return a + b; }
+EOF
+    if ! "$release_dir/bin/clang" --target=xtensa-esp-unknown-elf \
+        -mcpu=esp32 -ffreestanding -c "$test_dir/codegen.c" -o "$test_dir/esp32.o" ||
+       ! "$release_dir/bin/clang" --target=xtensa-esp-unknown-elf \
+        -mcpu=esp8266 -ffreestanding -c "$test_dir/codegen.c" -o "$test_dir/esp8266.o" ||
+       ! "$release_dir/bin/clang" --target=riscv32-esp-unknown-elf \
+        -mcpu=generic-rv32 -ffreestanding -c "$test_dir/codegen.c" -o "$test_dir/esp32c3.o"; then
+        rm -rf "$test_dir"
+        echo "Error: ESP32, ESP8266, or ESP32-C3 code generation failed" >&2
+        return 1
+    fi
+    for object in "$test_dir/esp32.o" "$test_dir/esp8266.o" "$test_dir/esp32c3.o"; do
+        if [[ ! -s "$object" ]]; then
+            rm -rf "$test_dir"
+            echo "Error: code generation produced an empty object: $object" >&2
+            return 1
+        fi
+    done
     rm -rf "$test_dir"
 
     echo "Validated LLVM $actual_version payload with targets: $targets"
