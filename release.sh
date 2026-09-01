@@ -374,12 +374,17 @@ validate_release() {
         exe_suffix=".exe"
     fi
 
-    for tool in clang clang++ clang-as ld.lld lld llvm-ar llvm-config llvm-nm llc opt; do
+    for tool in clang clang++ ld.lld lld llvm-ar llvm-config llvm-nm llc opt; do
         if [[ ! -x "$release_dir/bin/$tool$exe_suffix" ]]; then
             echo "Error: required tool $tool is missing from $release_dir/bin" >&2
             return 1
         fi
     done
+    if [[ "$target" == *-w64-mingw32 ]] &&
+       [[ ! -x "$release_dir/bin/clang-as.exe" ]]; then
+        echo "Error: required Windows driver alias clang-as is missing from $release_dir/bin" >&2
+        return 1
+    fi
 
     actual_version="$("$release_dir/bin/llvm-config$exe_suffix" --version)"
     if [[ "$actual_version" != "$LLVM_EXPECTED_VERSION"* ]]; then
