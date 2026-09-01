@@ -272,6 +272,8 @@ create_release_structure() {
 
     write_payload_manifest "$release_dir" "$target"
 
+    install_payload_licenses "$release_dir"
+
     validate_release "$release_dir" "$target"
 
     echo "Release directory created: $release_dir"
@@ -329,6 +331,35 @@ write_archive_checksum() {
     fi
 }
 
+install_payload_licenses() {
+    local release_dir="$1"
+    local license_dir="$release_dir/third-party-licenses"
+    local component source destination
+
+    mkdir -p "$license_dir"
+    cat > "$release_dir/THIRD-PARTY-LICENSES.txt" << 'EOF'
+This product embeds and uses the following pieces of software which have
+additional or alternate licenses:
+ - LLVM: third-party-licenses/LLVM-LICENSE.txt
+ - Clang: third-party-licenses/CLANG-LICENSE.txt
+ - lld: third-party-licenses/LLD-LICENSE.txt
+ - compiler-rt: third-party-licenses/COMPILER-RT-LICENSE.txt
+ - libc++: third-party-licenses/LIBCXX-LICENSE.txt
+ - libc++abi: third-party-licenses/LIBCXXABI-LICENSE.txt
+ - libunwind: third-party-licenses/LIBUNWIND-LICENSE.txt
+EOF
+
+    for component in llvm clang lld compiler-rt libcxx libcxxabi libunwind; do
+        source="$LLVM_PROJECTDIR/$component/LICENSE.TXT"
+        destination="$(printf '%s' "$component" | tr '[:lower:]' '[:upper:]')-LICENSE.txt"
+        [[ -f "$source" ]] || {
+            echo "Error: $component license is missing from $LLVM_PROJECTDIR" >&2
+            return 1
+        }
+        cp "$source" "$license_dir/$destination"
+    done
+}
+
 validate_release() {
     local release_dir="$1"
     local target="$2"
@@ -372,6 +403,16 @@ validate_release() {
         echo "Error: LLVMConfig.cmake is missing" >&2
         return 1
     }
+    [[ -f "$release_dir/THIRD-PARTY-LICENSES.txt" ]] || {
+        echo "Error: third-party license summary is missing" >&2
+        return 1
+    }
+    for component in LLVM CLANG LLD COMPILER-RT LIBCXX LIBCXXABI LIBUNWIND; do
+        [[ -f "$release_dir/third-party-licenses/$component-LICENSE.txt" ]] || {
+            echo "Error: $component license is missing from the payload" >&2
+            return 1
+        }
+    done
     if [[ "$target" == *-w64-mingw32 ]]; then
         # MinGW LLVM uses an unversioned DLL name, unlike ELF/Mach-O packages.
         # Accept either GNU's lib prefix or LLVM's native Windows spelling.
@@ -480,6 +521,7 @@ build_windows_platform() {
         return 1
     fi
     write_payload_manifest "$release_dir" "$target"
+    install_payload_licenses "$release_dir"
 
     # Cross-built PE executables cannot run on the Linux builder. Check the
     # complete archive on a native Windows runner before it can be released.
@@ -491,10 +533,6 @@ build_windows_platform() {
     done
     [[ -f "$release_dir/include/llvm-c/Core.h" ]] || {
         echo "Error: llvm-c/Core.h is missing from Windows payload" >&2
-        return 1
-    }
-    [[ -f "$release_dir/THIRD-PARTY-LICENSES.txt" ]] || {
-        echo "Error: Windows third-party license summary is missing" >&2
         return 1
     }
     [[ -f "$release_dir/third-party-licenses/COPYING.MinGW-w64-runtime.txt" ]] || {
