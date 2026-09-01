@@ -367,7 +367,7 @@ EOF
 validate_release() {
     local release_dir="$1"
     local target="$2"
-    local actual_version targets tool target_name test_dir exe_suffix
+    local actual_version targets tool tool_version target_name test_dir exe_suffix
 
     exe_suffix=""
     if [[ "$target" == *-w64-mingw32 ]]; then
@@ -386,6 +386,13 @@ validate_release() {
         echo "Error: llvm-config reports $actual_version, expected $LLVM_EXPECTED_VERSION.x" >&2
         return 1
     fi
+    for tool in opt ld.lld; do
+        tool_version="$("$release_dir/bin/$tool$exe_suffix" --version)"
+        if [[ "$tool_version" != *"$LLVM_EXPECTED_VERSION"* ]]; then
+            echo "Error: $tool reports $tool_version, expected $LLVM_EXPECTED_VERSION.x" >&2
+            return 1
+        fi
+    done
 
     targets="$("$release_dir/bin/llvm-config$exe_suffix" --targets-built)"
     local required_targets=(X86 ARM AArch64 AVR Mips RISCV WebAssembly Xtensa)
@@ -431,6 +438,19 @@ validate_release() {
     fi
 
     test_dir="$(mktemp -d)"
+    cat > "$test_dir/verify.ll" << 'EOF'
+define i32 @llgo_esp_verify_smoke(i32 %a, i32 %b) {
+  %sum = add i32 %a, %b
+  ret i32 %sum
+}
+EOF
+    if ! "$release_dir/bin/opt$exe_suffix" -passes=verify -disable-output \
+        "$test_dir/verify.ll"; then
+        rm -rf "$test_dir"
+        echo "Error: opt failed to verify valid LLVM IR" >&2
+        return 1
+    fi
+
     cat > "$test_dir/schedule-region.S" << 'EOF'
         .text
         .begin schedule
@@ -459,7 +479,20 @@ EOF
         echo "Error: ESP32, ESP8266, or ESP32-C3 code generation failed" >&2
         return 1
     fi
-    for object in "$test_dir/esp32.o" "$test_dir/esp8266.o" "$test_dir/esp32c3.o"; do
+    if ! "$release_dir/bin/ld.lld$exe_suffix" -r \
+        "$test_dir/esp32.o" -o "$test_dir/esp32-linked.o" ||
+       ! "$release_dir/bin/ld.lld$exe_suffix" -r \
+        "$test_dir/esp8266.o" -o "$test_dir/esp8266-linked.o" ||
+       ! "$release_dir/bin/ld.lld$exe_suffix" -r \
+        "$test_dir/esp32c3.o" -o "$test_dir/esp32c3-linked.o"; then
+        rm -rf "$test_dir"
+        echo "Error: ESP32, ESP8266, or ESP32-C3 relocatable link failed" >&2
+        return 1
+    fi
+    for object in \
+        "$test_dir/esp32.o" "$test_dir/esp8266.o" "$test_dir/esp32c3.o" \
+        "$test_dir/esp32-linked.o" "$test_dir/esp8266-linked.o" \
+        "$test_dir/esp32c3-linked.o"; do
         if [[ ! -s "$object" ]]; then
             rm -rf "$test_dir"
             echo "Error: code generation produced an empty object: $object" >&2
