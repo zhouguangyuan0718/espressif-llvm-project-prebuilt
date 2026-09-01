@@ -19,6 +19,10 @@ LLVM_EXPECTED_VERSION="${LLVM_EXPECTED_VERSION:-$ESP_LLVM_EXPECTED_VERSION}"
 LLVM_EXPECTED_MAJOR="${LLVM_EXPECTED_VERSION%%.*}"
 LLVM_SOURCE_REVISION=""
 LLVM_SOURCE_PATCH_SHA256=""
+# The pinned Espressif build scripts omit opt from their default Toolchain
+# distribution. LLGo needs it for IR verification and pass-plugin smoke tests,
+# so keep the upstream component set and add opt to the packaged payload.
+WINDOWS_DISTRIBUTION_COMPONENTS="clang-format;clang-resource-headers;clang-tidy;clang;clangd;dsymutil;llc;lld;llvm-ar;llvm-config;llvm-cov;llvm-cxxfilt;llvm-dwarfdump;llvm-nm;llvm-objcopy;llvm-objdump;llvm-profdata;llvm-ranlib;llvm-readelf;llvm-readobj;llvm-size;llvm-strings;llvm-strip;llvm-symbolizer;LTO;opt"
 
 # Resolve source and build roots before changing into the per-platform build
 # directory. This keeps local qualification builds isolated from the checkout
@@ -47,7 +51,7 @@ if [[ "$HOST_OS" == "Darwin" ]]; then
 fi
 
 # Supported build targets (native builds only)
-VALID_TARGETS="aarch64-apple-darwin aarch64-linux-gnu x86_64-apple-darwin x86_64-linux-gnu"
+VALID_TARGETS="aarch64-apple-darwin aarch64-linux-gnu x86_64-apple-darwin x86_64-linux-gnu x86_64-w64-mingw32"
 
 # Function to show usage
 show_usage() {
@@ -270,19 +274,11 @@ create_release_structure() {
         return 1
     fi
 
-    cat > "$release_dir/LLGO-LLVM-MANIFEST.txt" << EOF
-payload_version=$VERSION_STRING
-llvm_source_repository=https://github.com/espressif/llvm-project
-llvm_source_ref=$LLVM_REF
-llvm_source_revision=$LLVM_SOURCE_REVISION
-llvm_source_patches=$ESP_LLVM_PATCHES
-llvm_source_patch_sha256=$LLVM_SOURCE_PATCH_SHA256
-llvm_expected_version=$LLVM_EXPECTED_VERSION
-llvm_targets=X86;ARM;AArch64;AVR;Mips;RISCV;WebAssembly;Xtensa
-host_target=$target
-EOF
+    write_payload_manifest "$release_dir" "$target"
 
-    validate_release "$release_dir"
+    install_payload_licenses "$release_dir"
+
+    validate_release "$release_dir" "$target"
 
     echo "Release directory created: $release_dir"
     echo "Contents:"
@@ -295,57 +291,178 @@ EOF
     tar -cJf "../clang-esp-${VERSION_STRING}-${target}.tar.xz" esp-clang/
     cd - > /dev/null
 
-    local archive="dist/clang-esp-${VERSION_STRING}-${target}.tar.xz"
+    write_archive_checksum "dist/clang-esp-${VERSION_STRING}-${target}.tar.xz"
+
+    echo "Tarball created: dist/clang-esp-${VERSION_STRING}-${target}.tar.xz"
+    echo "Checksum created: dist/clang-esp-${VERSION_STRING}-${target}.tar.xz.sha256"
+    echo "Package size: $(du -h "dist/clang-esp-${VERSION_STRING}-${target}.tar.xz" | cut -f1)"
+}
+
+write_payload_manifest() {
+    local release_dir="$1"
+    local target="$2"
+    local llvm_targets="X86;ARM;AArch64;AVR;Mips;RISCV;WebAssembly;Xtensa"
+    if [[ "$target" == *-w64-mingw32 ]]; then
+        llvm_targets="RISCV;Xtensa"
+    fi
+    cat > "$release_dir/LLGO-LLVM-MANIFEST.txt" << EOF
+payload_version=$VERSION_STRING
+llvm_source_repository=https://github.com/espressif/llvm-project
+llvm_source_ref=$LLVM_REF
+llvm_source_revision=$LLVM_SOURCE_REVISION
+llvm_source_patches=$ESP_LLVM_PATCHES
+llvm_source_patch_sha256=$LLVM_SOURCE_PATCH_SHA256
+llvm_expected_version=$LLVM_EXPECTED_VERSION
+llvm_targets=$llvm_targets
+host_target=$target
+EOF
+    if [[ "$target" == *-w64-mingw32 ]]; then
+        cat >> "$release_dir/LLGO-LLVM-MANIFEST.txt" << EOF
+windows_build_scripts_repository=$ESP_LLVM_BUILD_SCRIPTS_REPOSITORY
+windows_build_scripts_revision=$ESP_LLVM_BUILD_SCRIPTS_REF
+windows_bootstrap=llvm-mingw-$LLVM_MINGW_VERSION
+windows_bootstrap_sha256=$LLVM_MINGW_LINUX_X86_64_SHA256
+EOF
+    fi
+}
+
+write_archive_checksum() {
+    local archive="$1"
     if command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$archive" > "$archive.sha256"
     else
         shasum -a 256 "$archive" > "$archive.sha256"
     fi
+}
 
-    echo "Tarball created: $archive"
-    echo "Checksum created: $archive.sha256"
-    echo "Package size: $(du -h "$archive" | cut -f1)"
+install_payload_licenses() {
+    local release_dir="$1"
+    local license_dir="$release_dir/third-party-licenses"
+    local component source destination
+
+    mkdir -p "$license_dir"
+    cat > "$release_dir/THIRD-PARTY-LICENSES.txt" << 'EOF'
+This product embeds and uses the following pieces of software which have
+additional or alternate licenses:
+ - LLVM: third-party-licenses/LLVM-LICENSE.txt
+ - Clang: third-party-licenses/CLANG-LICENSE.txt
+ - lld: third-party-licenses/LLD-LICENSE.txt
+ - compiler-rt: third-party-licenses/COMPILER-RT-LICENSE.txt
+ - libc++: third-party-licenses/LIBCXX-LICENSE.txt
+ - libc++abi: third-party-licenses/LIBCXXABI-LICENSE.txt
+ - libunwind: third-party-licenses/LIBUNWIND-LICENSE.txt
+EOF
+
+    for component in llvm clang lld compiler-rt libcxx libcxxabi libunwind; do
+        source="$LLVM_PROJECTDIR/$component/LICENSE.TXT"
+        destination="$(printf '%s' "$component" | tr '[:lower:]' '[:upper:]')-LICENSE.txt"
+        [[ -f "$source" ]] || {
+            echo "Error: $component license is missing from $LLVM_PROJECTDIR" >&2
+            return 1
+        }
+        cp "$source" "$license_dir/$destination"
+    done
 }
 
 validate_release() {
     local release_dir="$1"
-    local actual_version targets tool target_name test_dir
+    local target="$2"
+    local actual_version targets tool tool_version target_name test_dir exe_suffix
+
+    exe_suffix=""
+    if [[ "$target" == *-w64-mingw32 ]]; then
+        exe_suffix=".exe"
+    fi
 
     for tool in clang clang++ ld.lld lld llvm-ar llvm-config llvm-nm llc opt; do
-        if [[ ! -x "$release_dir/bin/$tool" ]]; then
+        if [[ ! -x "$release_dir/bin/$tool$exe_suffix" ]]; then
             echo "Error: required tool $tool is missing from $release_dir/bin" >&2
             return 1
         fi
     done
 
-    actual_version="$("$release_dir/bin/llvm-config" --version)"
+    actual_version="$("$release_dir/bin/llvm-config$exe_suffix" --version)"
     if [[ "$actual_version" != "$LLVM_EXPECTED_VERSION"* ]]; then
         echo "Error: llvm-config reports $actual_version, expected $LLVM_EXPECTED_VERSION.x" >&2
         return 1
     fi
+    for tool in opt ld.lld; do
+        tool_version="$("$release_dir/bin/$tool$exe_suffix" --version)"
+        if [[ "$tool_version" != *"$LLVM_EXPECTED_VERSION"* ]]; then
+            echo "Error: $tool reports $tool_version, expected $LLVM_EXPECTED_VERSION.x" >&2
+            return 1
+        fi
+    done
 
-    targets="$("$release_dir/bin/llvm-config" --targets-built)"
-    for target_name in X86 ARM AArch64 AVR Mips RISCV WebAssembly Xtensa; do
+    targets="$("$release_dir/bin/llvm-config$exe_suffix" --targets-built)"
+    local required_targets=(X86 ARM AArch64 AVR Mips RISCV WebAssembly Xtensa)
+    if [[ "$target" == *-w64-mingw32 ]]; then
+        required_targets=(RISCV Xtensa)
+    fi
+    for target_name in "${required_targets[@]}"; do
         if [[ " $targets " != *" $target_name "* ]]; then
             echo "Error: required LLVM target $target_name is missing: $targets" >&2
             return 1
         fi
     done
 
-    [[ -f "$release_dir/include/llvm-c/Core.h" ]] || {
-        echo "Error: llvm-c/Core.h is missing" >&2
+    if [[ "$target" == *-w64-mingw32 ]]; then
+        # Espressif's MinGW distribution is an executable target toolchain,
+        # not the LLVM development SDK used to build LLGo's Go bindings. Its
+        # pinned component set intentionally installs only the public LTO
+        # interface, rather than llvm-headers and LLVM CMake package files.
+        [[ -f "$release_dir/include/llvm-c/lto.h" ]] || {
+            echo "Error: LLVM LTO header is missing from Windows payload" >&2
+            return 1
+        }
+        [[ -f "$release_dir/bin/libLTO.dll" ]] || {
+            echo "Error: LLVM LTO DLL is missing from Windows payload" >&2
+            return 1
+        }
+        [[ -f "$release_dir/lib/libLTO.dll.a" ]] || {
+            echo "Error: LLVM LTO import library is missing from Windows payload" >&2
+            return 1
+        }
+    else
+        [[ -f "$release_dir/include/llvm-c/Core.h" ]] || {
+            echo "Error: llvm-c/Core.h is missing" >&2
+            return 1
+        }
+        [[ -f "$release_dir/lib/cmake/llvm/LLVMConfig.cmake" ]] || {
+            echo "Error: LLVMConfig.cmake is missing" >&2
+            return 1
+        }
+    fi
+    [[ -f "$release_dir/THIRD-PARTY-LICENSES.txt" ]] || {
+        echo "Error: third-party license summary is missing" >&2
         return 1
     }
-    [[ -f "$release_dir/lib/cmake/llvm/LLVMConfig.cmake" ]] || {
-        echo "Error: LLVMConfig.cmake is missing" >&2
-        return 1
-    }
-    if ! find "$release_dir/lib" -maxdepth 1 -name "libLLVM-$LLVM_EXPECTED_MAJOR.*" -print -quit | grep -q .; then
+    for component in LLVM CLANG LLD COMPILER-RT LIBCXX LIBCXXABI LIBUNWIND; do
+        [[ -f "$release_dir/third-party-licenses/$component-LICENSE.txt" ]] || {
+            echo "Error: $component license is missing from the payload" >&2
+            return 1
+        }
+    done
+    if [[ "$target" != *-w64-mingw32 ]] &&
+       ! find "$release_dir/lib" -maxdepth 1 -name "libLLVM-$LLVM_EXPECTED_MAJOR.*" -print -quit | grep -q .; then
         echo "Error: libLLVM-$LLVM_EXPECTED_MAJOR shared library is missing" >&2
         return 1
     fi
 
     test_dir="$(mktemp -d)"
+    cat > "$test_dir/verify.ll" << 'EOF'
+define i32 @llgo_esp_verify_smoke(i32 %a, i32 %b) {
+  %sum = add i32 %a, %b
+  ret i32 %sum
+}
+EOF
+    if ! "$release_dir/bin/opt$exe_suffix" -passes=verify -disable-output \
+        "$test_dir/verify.ll"; then
+        rm -rf "$test_dir"
+        echo "Error: opt failed to verify valid LLVM IR" >&2
+        return 1
+    fi
+
     cat > "$test_dir/schedule-region.S" << 'EOF'
         .text
         .begin schedule
@@ -354,7 +471,7 @@ schedule_region_smoke_test:
         ret
         .end schedule
 EOF
-    if ! "$release_dir/bin/clang" --target=xtensa -c \
+    if ! "$release_dir/bin/clang$exe_suffix" --target=xtensa -c \
         "$test_dir/schedule-region.S" -o "$test_dir/schedule-region.o"; then
         rm -rf "$test_dir"
         echo "Error: Xtensa assembler does not accept schedule regions" >&2
@@ -364,17 +481,30 @@ EOF
     cat > "$test_dir/codegen.c" << 'EOF'
 int llgo_esp_codegen_smoke(int a, int b) { return a + b; }
 EOF
-    if ! "$release_dir/bin/clang" --target=xtensa-esp-unknown-elf \
+    if ! "$release_dir/bin/clang$exe_suffix" --target=xtensa-esp-unknown-elf \
         -mcpu=esp32 -ffreestanding -c "$test_dir/codegen.c" -o "$test_dir/esp32.o" ||
-       ! "$release_dir/bin/clang" --target=xtensa-esp-unknown-elf \
+       ! "$release_dir/bin/clang$exe_suffix" --target=xtensa-esp-unknown-elf \
         -mcpu=esp8266 -ffreestanding -c "$test_dir/codegen.c" -o "$test_dir/esp8266.o" ||
-       ! "$release_dir/bin/clang" --target=riscv32-esp-unknown-elf \
+       ! "$release_dir/bin/clang$exe_suffix" --target=riscv32-esp-unknown-elf \
         -mcpu=generic-rv32 -ffreestanding -c "$test_dir/codegen.c" -o "$test_dir/esp32c3.o"; then
         rm -rf "$test_dir"
         echo "Error: ESP32, ESP8266, or ESP32-C3 code generation failed" >&2
         return 1
     fi
-    for object in "$test_dir/esp32.o" "$test_dir/esp8266.o" "$test_dir/esp32c3.o"; do
+    if ! "$release_dir/bin/ld.lld$exe_suffix" -r \
+        "$test_dir/esp32.o" -o "$test_dir/esp32-linked.o" ||
+       ! "$release_dir/bin/ld.lld$exe_suffix" -r \
+        "$test_dir/esp8266.o" -o "$test_dir/esp8266-linked.o" ||
+       ! "$release_dir/bin/ld.lld$exe_suffix" -r \
+        "$test_dir/esp32c3.o" -o "$test_dir/esp32c3-linked.o"; then
+        rm -rf "$test_dir"
+        echo "Error: ESP32, ESP8266, or ESP32-C3 relocatable link failed" >&2
+        return 1
+    fi
+    for object in \
+        "$test_dir/esp32.o" "$test_dir/esp8266.o" "$test_dir/esp32c3.o" \
+        "$test_dir/esp32-linked.o" "$test_dir/esp8266-linked.o" \
+        "$test_dir/esp32c3-linked.o"; do
         if [[ ! -s "$object" ]]; then
             rm -rf "$test_dir"
             echo "Error: code generation produced an empty object: $object" >&2
@@ -386,9 +516,111 @@ EOF
     echo "Validated LLVM $actual_version payload with targets: $targets"
 }
 
+download_build_scripts() {
+    local scripts_dir="${ESP_LLVM_BUILD_SCRIPTS_DIR:-$SCRIPT_DIR/esp-llvm-embedded-toolchain}"
+    if [[ ! -d "$scripts_dir/.git" ]]; then
+        git clone --filter=blob:none --no-checkout "$ESP_LLVM_BUILD_SCRIPTS_REPOSITORY" "$scripts_dir"
+        git -C "$scripts_dir" fetch --depth=1 origin "$ESP_LLVM_BUILD_SCRIPTS_REF"
+        git -C "$scripts_dir" checkout --detach FETCH_HEAD
+    fi
+    local actual_revision
+    actual_revision="$(git -C "$scripts_dir" rev-parse HEAD)"
+    if [[ "$actual_revision" != "$ESP_LLVM_BUILD_SCRIPTS_REF" ]]; then
+        echo "Error: $scripts_dir is at $actual_revision, expected $ESP_LLVM_BUILD_SCRIPTS_REF" >&2
+        return 1
+    fi
+    echo "$scripts_dir"
+}
+
+build_windows_platform() {
+    local target="$1"
+    local build_dir="$BUILD_DIR_BASE/$target"
+    local install_dir="$SCRIPT_DIR/install/$target"
+    local release_dir="$build_dir/unpack/esp-clang"
+    local scripts_dir
+
+    if ! command -v x86_64-w64-mingw32-clang >/dev/null 2>&1 ||
+       ! command -v x86_64-w64-mingw32-clang++ >/dev/null 2>&1; then
+        echo "Error: the pinned llvm-mingw bootstrap is required for $target" >&2
+        return 1
+    fi
+    scripts_dir="$(download_build_scripts)"
+
+    mkdir -p "$build_dir" "$install_dir"
+    cmake -S "$scripts_dir" -B "$build_dir" -G Ninja \
+        -DFETCHCONTENT_SOURCE_DIR_LLVMPROJECT="$LLVM_PROJECTDIR" \
+        -DFETCHCONTENT_QUIET=OFF \
+        -DLLVM_TOOLCHAIN_C_LIBRARY=none \
+        -DLLVM_TOOLCHAIN_CXX_LIBRARIES= \
+        -DLLVM_TOOLCHAIN_RT_LIBRARIES= \
+        -DLLVM_TOOLCHAIN_INCLUDE_GNU_BINUTILS=OFF \
+        -DLLVM_TOOLCHAIN_ESPRESSIF=ON \
+        -DLLVM_TOOLCHAIN_CROSS_BUILD_MINGW=ON \
+        -DLLVM_TOOLCHAIN_HOST_TRIPLE="$target" \
+        '-DLLVM_TOOLCHAIN_ENABLED_TARGETS=RISCV;Xtensa' \
+        -DLLVM_Toolchain_DISTRIBUTION_COMPONENTS="$WINDOWS_DISTRIBUTION_COMPONENTS" \
+        -DLLVM_TOOLCHAIN_PACKAGE_NAME=esp-clang \
+        -DESP_TOOLCHAIN_VER="esp-$VERSION_STRING" \
+        -DCLANG_REPOSITORY_STRING=https://github.com/espressif/llvm-project.git \
+        -DCPACK_ARCHIVE_THREADS=0 \
+        -DCMAKE_INSTALL_PREFIX="$install_dir"
+
+    cmake --build "$build_dir" --target package-llvm-toolchain -j"$(get_cpu_cores)"
+    cmake --build "$build_dir" --target unpack-llvm-toolchain
+    if [[ ! -d "$release_dir" ]]; then
+        echo "Error: packaged Windows toolchain is missing $release_dir" >&2
+        return 1
+    fi
+    write_payload_manifest "$release_dir" "$target"
+    install_payload_licenses "$release_dir"
+
+    # Cross-built PE executables cannot run on the Linux builder. Check the
+    # complete archive on a native Windows runner before it can be released.
+    for tool in clang clang++ ld.lld lld llvm-ar llvm-config llvm-nm llc opt; do
+        [[ -f "$release_dir/bin/$tool.exe" ]] || {
+            echo "Error: required Windows tool $tool.exe is missing" >&2
+            return 1
+        }
+    done
+    [[ -f "$release_dir/include/llvm-c/lto.h" ]] || {
+        echo "Error: LLVM LTO header is missing from Windows payload" >&2
+        return 1
+    }
+    [[ -f "$release_dir/bin/libLTO.dll" ]] || {
+        echo "Error: LLVM LTO DLL is missing from Windows payload" >&2
+        return 1
+    }
+    [[ -f "$release_dir/lib/libLTO.dll.a" ]] || {
+        echo "Error: LLVM LTO import library is missing from Windows payload" >&2
+        return 1
+    }
+    [[ -f "$release_dir/third-party-licenses/COPYING.MinGW-w64-runtime.txt" ]] || {
+        echo "Error: MinGW runtime license is missing from Windows payload" >&2
+        return 1
+    }
+
+    cmake --build "$build_dir" --target repack-llvm-toolchain
+    local generated_archive
+    generated_archive="$(find "$build_dir" -maxdepth 1 -name "clang-esp-*-$target.tar.xz" -print -quit)"
+    if [[ -z "$generated_archive" ]]; then
+        echo "Error: Windows package archive was not generated" >&2
+        return 1
+    fi
+    mkdir -p "$SCRIPT_DIR/dist"
+    local archive="$SCRIPT_DIR/dist/clang-esp-$VERSION_STRING-$target.tar.xz"
+    cp "$generated_archive" "$archive"
+    write_archive_checksum "$archive"
+    echo "Windows cross-build completed: $archive"
+}
+
 # Main build function (native builds only)
 build_platform() {
     local target="$1"
+
+    if [[ "$target" == *-w64-mingw32 ]]; then
+        build_windows_platform "$target"
+        return
+    fi
 
     echo "Building LLVM for platform: $target"
     echo "Version: $VERSION_STRING"
@@ -456,6 +688,10 @@ build_platform() {
 
 # Main script logic
 main() {
+    if [[ "$#" -eq 3 && "$1" == "--validate" ]]; then
+        validate_release "$2" "$3"
+        return
+    fi
     if [[ $# -ne 1 ]]; then
         show_usage
         exit 1

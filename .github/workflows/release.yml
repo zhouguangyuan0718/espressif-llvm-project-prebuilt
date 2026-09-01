@@ -116,6 +116,13 @@ jobs:
             os: macos-14
             runner: macos-14
 
+          # Windows x86-64 build. Espressif's supported build is a Linux-hosted
+          # MinGW cross build; a separate native Windows job executes and
+          # validates every packaged tool before release.
+          - target: x86_64-w64-mingw32
+            os: ubuntu-22.04
+            runner: ubuntu-22.04
+
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
 
@@ -164,6 +171,20 @@ jobs:
         brew uninstall cmake || true
         brew install cmake ninja
 
+    - name: Install pinned LLVM 22 MinGW bootstrap
+      if: matrix.target == 'x86_64-w64-mingw32'
+      shell: bash
+      run: |
+        source toolchain.env
+        archive="llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-x86_64.tar.xz"
+        url="https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${archive}"
+        curl -L --fail --retry 3 -o "$RUNNER_TEMP/$archive" "$url"
+        printf '%s  %s\n' "$LLVM_MINGW_LINUX_X86_64_SHA256" "$RUNNER_TEMP/$archive" | sha256sum -c -
+        root="$RUNNER_TOOL_CACHE/llvm-mingw/$LLVM_MINGW_VERSION"
+        mkdir -p "$root"
+        tar -xf "$RUNNER_TEMP/$archive" --strip-components=1 -C "$root"
+        echo "$root/bin" >> "$GITHUB_PATH"
+
     - name: Build esp-clang package
       shell: bash
       env:
@@ -188,9 +209,39 @@ jobs:
         # Shorter retention for PR builds, longer for releases
         retention-days: ${{ github.event_name == 'pull_request' && 7 || 30 }}
 
+  validate-windows:
+    name: Validate esp-clang for x86_64-w64-mingw32
+    needs: [prepare, build]
+    runs-on: windows-2022
+    steps:
+    - name: Checkout payload contract
+      uses: actions/checkout@v4
+
+    - name: Download Windows payload
+      uses: actions/download-artifact@v4
+      with:
+        name: x86_64-w64-mingw32-esp-clang-packages
+        path: artifacts
+
+    - name: Verify, extract, and execute payload
+      shell: bash
+      env:
+        TAG: ${{ needs.prepare.outputs.tag }}
+        LLVM_REF: ${{ needs.prepare.outputs.llvm_ref }}
+        LLVM_EXPECTED_VERSION: ${{ needs.prepare.outputs.llvm_expected_version }}
+      run: |
+        archive="artifacts/clang-esp-${TAG}-x86_64-w64-mingw32.tar.xz"
+        checksum="$archive.sha256"
+        expected="$(cut -d' ' -f1 "$checksum")"
+        actual="$(sha256sum "$archive" | cut -d' ' -f1)"
+        test "$actual" = "$expected"
+        mkdir extracted
+        tar -xf "$archive" -C extracted
+        ./release.sh --validate "$PWD/extracted/esp-clang" x86_64-w64-mingw32
+
   release:
     name: Create Release
-    needs: [prepare, build]
+    needs: [prepare, build, validate-windows]
     if: needs.prepare.outputs.upload == 'true' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
 
