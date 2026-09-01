@@ -470,8 +470,9 @@ EOF
 download_build_scripts() {
     local scripts_dir="${ESP_LLVM_BUILD_SCRIPTS_DIR:-$SCRIPT_DIR/esp-llvm-embedded-toolchain}"
     if [[ ! -d "$scripts_dir/.git" ]]; then
-        git clone --filter=blob:none "$ESP_LLVM_BUILD_SCRIPTS_REPOSITORY" "$scripts_dir"
-        git -C "$scripts_dir" checkout --detach "$ESP_LLVM_BUILD_SCRIPTS_REF"
+        git clone --filter=blob:none --no-checkout "$ESP_LLVM_BUILD_SCRIPTS_REPOSITORY" "$scripts_dir"
+        git -C "$scripts_dir" fetch --depth=1 origin "$ESP_LLVM_BUILD_SCRIPTS_REF"
+        git -C "$scripts_dir" checkout --detach FETCH_HEAD
     fi
     local actual_revision
     actual_revision="$(git -C "$scripts_dir" rev-parse HEAD)"
