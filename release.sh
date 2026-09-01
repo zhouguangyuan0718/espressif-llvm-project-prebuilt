@@ -20,6 +20,16 @@ LLVM_EXPECTED_MAJOR="${LLVM_EXPECTED_VERSION%%.*}"
 LLVM_SOURCE_REVISION=""
 LLVM_SOURCE_PATCH_SHA256=""
 
+# Resolve source and build roots before changing into the per-platform build
+# directory. This keeps local qualification builds isolated from the checkout
+# and makes absolute paths behave the same way as the workflow defaults.
+if [[ "$LLVM_PROJECTDIR" != /* ]]; then
+    LLVM_PROJECTDIR="$SCRIPT_DIR/$LLVM_PROJECTDIR"
+fi
+if [[ "$BUILD_DIR_BASE" != /* ]]; then
+    BUILD_DIR_BASE="$SCRIPT_DIR/$BUILD_DIR_BASE"
+fi
+
 # Detect host system
 if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "win32" ]] || [[ -n "${WINDIR:-}" ]]; then
     HOST_OS="Windows_NT"
@@ -350,6 +360,27 @@ EOF
         echo "Error: Xtensa assembler does not accept schedule regions" >&2
         return 1
     fi
+
+    cat > "$test_dir/codegen.c" << 'EOF'
+int llgo_esp_codegen_smoke(int a, int b) { return a + b; }
+EOF
+    if ! "$release_dir/bin/clang" --target=xtensa-esp-unknown-elf \
+        -mcpu=esp32 -ffreestanding -c "$test_dir/codegen.c" -o "$test_dir/esp32.o" ||
+       ! "$release_dir/bin/clang" --target=xtensa-esp-unknown-elf \
+        -mcpu=esp8266 -ffreestanding -c "$test_dir/codegen.c" -o "$test_dir/esp8266.o" ||
+       ! "$release_dir/bin/clang" --target=riscv32-esp-unknown-elf \
+        -mcpu=generic-rv32 -ffreestanding -c "$test_dir/codegen.c" -o "$test_dir/esp32c3.o"; then
+        rm -rf "$test_dir"
+        echo "Error: ESP32, ESP8266, or ESP32-C3 code generation failed" >&2
+        return 1
+    fi
+    for object in "$test_dir/esp32.o" "$test_dir/esp8266.o" "$test_dir/esp32c3.o"; do
+        if [[ ! -s "$object" ]]; then
+            rm -rf "$test_dir"
+            echo "Error: code generation produced an empty object: $object" >&2
+            return 1
+        fi
+    done
     rm -rf "$test_dir"
 
     echo "Validated LLVM $actual_version payload with targets: $targets"
@@ -394,7 +425,7 @@ build_platform() {
     # Configure
     echo "Configuring build for $target..."
     cd "$build_dir"
-    cmake "../../$LLVM_PROJECTDIR/llvm" "${cmake_args[@]}"
+    cmake "$LLVM_PROJECTDIR/llvm" "${cmake_args[@]}"
 
     # Build
     echo "Building $target..."
