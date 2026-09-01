@@ -20,6 +20,16 @@ LLVM_EXPECTED_MAJOR="${LLVM_EXPECTED_VERSION%%.*}"
 LLVM_SOURCE_REVISION=""
 LLVM_SOURCE_PATCH_SHA256=""
 
+# Resolve source and build roots before changing into the per-platform build
+# directory. This keeps local qualification builds isolated from the checkout
+# and makes absolute paths behave the same way as the workflow defaults.
+if [[ "$LLVM_PROJECTDIR" != /* ]]; then
+    LLVM_PROJECTDIR="$SCRIPT_DIR/$LLVM_PROJECTDIR"
+fi
+if [[ "$BUILD_DIR_BASE" != /* ]]; then
+    BUILD_DIR_BASE="$SCRIPT_DIR/$BUILD_DIR_BASE"
+fi
+
 # Detect host system
 if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "win32" ]] || [[ -n "${WINDIR:-}" ]]; then
     HOST_OS="Windows_NT"
@@ -394,7 +404,7 @@ build_platform() {
     # Configure
     echo "Configuring build for $target..."
     cd "$build_dir"
-    cmake "../../$LLVM_PROJECTDIR/llvm" "${cmake_args[@]}"
+    cmake "$LLVM_PROJECTDIR/llvm" "${cmake_args[@]}"
 
     # Build
     echo "Building $target..."
