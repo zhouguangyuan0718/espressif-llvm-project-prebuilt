@@ -374,17 +374,20 @@ validate_release() {
         exe_suffix=".exe"
     fi
 
-    for tool in clang clang++ ld.lld lld llvm-ar llvm-config llvm-nm llc opt; do
+    local required_tools=(clang clang++ ld.lld lld llvm-ar llvm-config llvm-nm llc opt)
+    if [[ "$target" == *-w64-mingw32 ]]; then
+        required_tools+=(
+            clang-as
+            xtensa-esp32-elf-clang-as
+            xtensa-esp8266-elf-clang-as
+        )
+    fi
+    for tool in "${required_tools[@]}"; do
         if [[ ! -x "$release_dir/bin/$tool$exe_suffix" ]]; then
             echo "Error: required tool $tool is missing from $release_dir/bin" >&2
             return 1
         fi
     done
-    if [[ "$target" == *-w64-mingw32 ]] &&
-       [[ ! -x "$release_dir/bin/clang-as.exe" ]]; then
-        echo "Error: required Windows driver alias clang-as is missing from $release_dir/bin" >&2
-        return 1
-    fi
 
     actual_version="$("$release_dir/bin/llvm-config$exe_suffix" --version)"
     if [[ "$actual_version" != "$LLVM_EXPECTED_VERSION"* ]]; then
@@ -426,6 +429,10 @@ validate_release() {
         }
         [[ -f "$release_dir/lib/libLTO.dll.a" ]] || {
             echo "Error: LLVM LTO import library is missing from Windows payload" >&2
+            return 1
+        }
+        [[ ! -e "$release_dir/lib/clang-runtimes/multilib.yaml" ]] || {
+            echo "Error: runtime-free Windows payload contains a stale multilib.yaml" >&2
             return 1
         }
     else
@@ -476,22 +483,27 @@ schedule_region_smoke_test:
         ret
         .end schedule
 EOF
-    if ! "$release_dir/bin/clang++$exe_suffix" --target=xtensa -c \
-        "$test_dir/schedule-region.S" -o "$test_dir/schedule-region.o"; then
-        rm -rf "$test_dir"
-        echo "Error: the Clang C++ driver cannot execute the Xtensa assembler" >&2
-        return 1
-    fi
+    local cpu
+    for cpu in esp32 esp8266; do
+        if ! "$release_dir/bin/clang++$exe_suffix" \
+            --target=xtensa-esp-unknown-elf -mcpu="$cpu" -Werror -c \
+            "$test_dir/schedule-region.S" \
+            -o "$test_dir/schedule-region-$cpu.o"; then
+            rm -rf "$test_dir"
+            echo "Error: the Clang C++ driver cannot execute the $cpu Xtensa assembler" >&2
+            return 1
+        fi
+    done
 
     cat > "$test_dir/codegen.c" << 'EOF'
 int llgo_esp_codegen_smoke(int a, int b) { return a + b; }
 EOF
     if ! "$release_dir/bin/clang$exe_suffix" --target=xtensa-esp-unknown-elf \
-        -mcpu=esp32 -ffreestanding -c "$test_dir/codegen.c" -o "$test_dir/esp32.o" ||
+        -mcpu=esp32 -Werror -ffreestanding -c "$test_dir/codegen.c" -o "$test_dir/esp32.o" ||
        ! "$release_dir/bin/clang$exe_suffix" --target=xtensa-esp-unknown-elf \
-        -mcpu=esp8266 -ffreestanding -c "$test_dir/codegen.c" -o "$test_dir/esp8266.o" ||
+        -mcpu=esp8266 -Werror -ffreestanding -c "$test_dir/codegen.c" -o "$test_dir/esp8266.o" ||
        ! "$release_dir/bin/clang$exe_suffix" --target=riscv32-esp-unknown-elf \
-        -mcpu=generic-rv32 -ffreestanding -c "$test_dir/codegen.c" -o "$test_dir/esp32c3.o"; then
+        -mcpu=generic-rv32 -Werror -ffreestanding -c "$test_dir/codegen.c" -o "$test_dir/esp32c3.o"; then
         rm -rf "$test_dir"
         echo "Error: ESP32, ESP8266, or ESP32-C3 code generation failed" >&2
         return 1
@@ -578,18 +590,32 @@ build_windows_platform() {
     fi
 
     # The pinned Espressif packaging script removes unlisted Windows symlinks.
-    # LLVM 22's clang++ driver re-executes itself through the clang-as alias for
-    # assembler input, so preserve that alias as a regular PE executable just
-    # like the script already does for clang++ and clang-cpp.
-    if [[ ! -f "$release_dir/bin/clang-as.exe" ]]; then
-        cp "$release_dir/bin/clang.exe" "$release_dir/bin/clang-as.exe"
-    fi
+    # Its Xtensa driver does not execute the generic clang-as name: it derives
+    # a CPU-specific program name such as xtensa-esp32-elf-clang-as. Preserve
+    # every alias used by LLGo as a regular PE executable.
+    local clang_as_alias
+    for clang_as_alias in \
+        clang-as \
+        xtensa-esp32-elf-clang-as \
+        xtensa-esp8266-elf-clang-as; do
+        cp "$release_dir/bin/clang.exe" "$release_dir/bin/$clang_as_alias.exe"
+    done
+
+    # This executable-only payload deliberately builds no target runtime
+    # variants. The build scripts nevertheless install an empty multilib.yaml,
+    # which makes Clang diagnose every ESP invocation and turns into a hard
+    # error under LLGo's -Werror target profiles.
+    rm -f "$release_dir/lib/clang-runtimes/multilib.yaml"
+    rmdir "$release_dir/lib/clang-runtimes" 2>/dev/null || true
     write_payload_manifest "$release_dir" "$target"
     install_payload_licenses "$release_dir"
 
     # Cross-built PE executables cannot run on the Linux builder. Check the
     # complete archive on a native Windows runner before it can be released.
-    for tool in clang clang++ clang-as ld.lld lld llvm-ar llvm-config llvm-nm llc opt; do
+    for tool in \
+        clang clang++ clang-as \
+        xtensa-esp32-elf-clang-as xtensa-esp8266-elf-clang-as \
+        ld.lld lld llvm-ar llvm-config llvm-nm llc opt; do
         [[ -f "$release_dir/bin/$tool.exe" ]] || {
             echo "Error: required Windows tool $tool.exe is missing" >&2
             return 1
