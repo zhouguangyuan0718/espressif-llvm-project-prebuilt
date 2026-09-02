@@ -2,8 +2,16 @@ name: Build Espressif LLVM
 
 on:
   push:
+    branches:
+      - main
     tags:
       - '*'
+    paths:
+      - 'release.sh'
+      - 'toolchain.env'
+      - 'patches/**'
+      - '.github/workflows/release.yml'
+      - '**.md'
   pull_request:
     types:
       - opened
@@ -60,6 +68,10 @@ jobs:
           upload="true"
         elif [ "${{ github.event_name }}" = "pull_request" ]; then
           # PR build - no release, use the checked-in payload contract.
+          tag="$ESP_LLVM_PAYLOAD_VERSION"
+          upload="false"
+        elif [ "${{ github.event_name }}" = "push" ]; then
+          # A main-branch build warms the trusted cache consumed by a later tag.
           tag="$ESP_LLVM_PAYLOAD_VERSION"
           upload="false"
         elif [ -n "${{ inputs.tag }}" ]; then
@@ -125,10 +137,38 @@ jobs:
 
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 2G
+      CCACHE_COMPRESS: 'true'
+      CCACHE_COMPILERCHECK: content
+      REQUIRE_CCACHE: '1'
 
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+
+    # A PR cache is isolated to that PR. Once merged, the main-branch build
+    # publishes the trusted cache that a tag build may restore. Tag builds use
+    # restore-only so they do not spend repository cache quota on tag-scoped
+    # entries that future releases cannot reuse.
+    - name: Restore and save ccache
+      if: github.ref_type != 'tag'
+      uses: actions/cache@v5
+      with:
+        path: ${{ env.CCACHE_DIR }}
+        key: esp-llvm-ccache-v1-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('toolchain.env', 'release.sh', '.github/workflows/release.yml', 'patches/**') }}
+        restore-keys: |
+          esp-llvm-ccache-v1-${{ runner.os }}-${{ matrix.target }}-
+
+    - name: Restore ccache for release
+      if: github.ref_type == 'tag'
+      uses: actions/cache/restore@v5
+      with:
+        path: ${{ env.CCACHE_DIR }}
+        key: esp-llvm-ccache-v1-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('toolchain.env', 'release.sh', '.github/workflows/release.yml', 'patches/**') }}
+        restore-keys: |
+          esp-llvm-ccache-v1-${{ runner.os }}-${{ matrix.target }}-
 
     - name: Install build dependencies (Linux containers)
       if: matrix.container == 'ubuntu:20.04'
@@ -140,7 +180,7 @@ jobs:
         sed -i 's|http://security.ubuntu.com/ubuntu/|http://mirrors.kernel.org/ubuntu/|g' /etc/apt/sources.list
         
         apt-get update --fix-missing
-        apt-get install -y build-essential ninja-build git ca-certificates wget python3 python3-pip
+        apt-get install -y build-essential ninja-build git ca-certificates wget python3 python3-pip ccache
         
         # Install newer CMake (LLVM requires 3.20+, Ubuntu 20.04 has 3.16)
         CMAKE_VERSION="3.25.3"
@@ -160,16 +200,16 @@ jobs:
         cmake --version
 
     - name: Install build dependencies (Linux)
-      if: matrix.os == 'ubuntu-22.04-arm' && matrix.container != 'ubuntu:20.04'
+      if: startsWith(matrix.os, 'ubuntu-') && matrix.container != 'ubuntu:20.04'
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential cmake ninja-build
+        sudo apt-get install -y build-essential cmake ninja-build ccache
 
     - name: Install build dependencies (macOS)
       if: startsWith(matrix.os, 'macos-')
       run: |
         brew uninstall cmake || true
-        brew install cmake ninja
+        brew install cmake ninja ccache
 
     - name: Install pinned LLVM 22 MinGW bootstrap
       if: matrix.target == 'x86_64-w64-mingw32'
@@ -192,6 +232,15 @@ jobs:
         LLVM_REF: ${{ needs.prepare.outputs.llvm_ref }}
         LLVM_EXPECTED_VERSION: ${{ needs.prepare.outputs.llvm_expected_version }}
       run: ./release.sh ${{ matrix.target }}
+
+    - name: Show ccache statistics
+      if: always()
+      shell: bash
+      run: |
+        if command -v ccache >/dev/null 2>&1; then
+          ccache --show-stats
+          du -sh "$CCACHE_DIR" || true
+        fi
 
     - name: List generated packages
       shell: bash

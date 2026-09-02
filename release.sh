@@ -19,6 +19,7 @@ LLVM_EXPECTED_VERSION="${LLVM_EXPECTED_VERSION:-$ESP_LLVM_EXPECTED_VERSION}"
 LLVM_EXPECTED_MAJOR="${LLVM_EXPECTED_VERSION%%.*}"
 LLVM_SOURCE_REVISION=""
 LLVM_SOURCE_PATCH_SHA256=""
+CCACHE_EXECUTABLE=""
 # The pinned Espressif build scripts omit opt from their default Toolchain
 # distribution. LLGo needs it for IR verification and pass-plugin smoke tests,
 # so keep the upstream component set and add opt to the packaged payload.
@@ -70,6 +71,7 @@ show_usage() {
     echo "  LLVM_EXPECTED_VERSION - llvm-config version prefix (default: $LLVM_EXPECTED_VERSION)"
     echo "  LLVM_PROJECTDIR  - LLVM source directory (default: $LLVM_PROJECTDIR)"
     echo "  BUILD_DIR_BASE   - Build directory base (default: $BUILD_DIR_BASE)"
+    echo "  REQUIRE_CCACHE   - Fail if ccache is unavailable (default: 0)"
     echo ""
 }
 
@@ -254,6 +256,49 @@ get_cpu_cores() {
     fi
 }
 
+setup_ccache() {
+    CCACHE_EXECUTABLE="$(command -v ccache || true)"
+    if [[ -z "$CCACHE_EXECUTABLE" ]]; then
+        if [[ "${REQUIRE_CCACHE:-0}" == "1" ]]; then
+            echo "Error: REQUIRE_CCACHE=1 but ccache is unavailable" >&2
+            return 1
+        fi
+        echo "ccache is unavailable; continuing without a compiler cache"
+        return
+    fi
+
+    echo "Using ccache compiler launcher: $CCACHE_EXECUTABLE"
+    "$CCACHE_EXECUTABLE" --version
+    "$CCACHE_EXECUTABLE" --zero-stats
+}
+
+get_ccache_cmake_args() {
+    if [[ -n "$CCACHE_EXECUTABLE" ]]; then
+        printf '%s\n' \
+            "-DCMAKE_C_COMPILER_LAUNCHER=$CCACHE_EXECUTABLE" \
+            "-DCMAKE_CXX_COMPILER_LAUNCHER=$CCACHE_EXECUTABLE"
+    fi
+}
+
+validate_ccache_configuration() {
+    local build_dir="$1"
+    local cache_file="$build_dir/CMakeCache.txt"
+    local variable value
+
+    [[ -n "$CCACHE_EXECUTABLE" ]] || return
+    [[ -f "$cache_file" ]] || {
+        echo "Error: CMake cache is missing from $build_dir" >&2
+        return 1
+    }
+    for variable in CMAKE_C_COMPILER_LAUNCHER CMAKE_CXX_COMPILER_LAUNCHER; do
+        value="$(sed -n "s/^${variable}:[^=]*=//p" "$cache_file" | tail -n 1)"
+        if [[ "$value" != "$CCACHE_EXECUTABLE" ]]; then
+            echo "Error: $variable is '$value', expected '$CCACHE_EXECUTABLE'" >&2
+            return 1
+        fi
+    done
+}
+
 # Function to create release directory structure
 create_release_structure() {
     local target="$1"
@@ -273,6 +318,8 @@ create_release_structure() {
         echo "Warning: Install directory $install_dir not found"
         return 1
     fi
+
+    install_clang_driver_aliases "$release_dir" "$target"
 
     write_payload_manifest "$release_dir" "$target"
 
@@ -296,6 +343,40 @@ create_release_structure() {
     echo "Tarball created: dist/clang-esp-${VERSION_STRING}-${target}.tar.xz"
     echo "Checksum created: dist/clang-esp-${VERSION_STRING}-${target}.tar.xz.sha256"
     echo "Package size: $(du -h "dist/clang-esp-${VERSION_STRING}-${target}.tar.xz" | cut -f1)"
+}
+
+install_clang_driver_aliases() {
+    local release_dir="$1"
+    local target="$2"
+    local exe_suffix=""
+    local alias
+
+    if [[ "$target" == *-w64-mingw32 ]]; then
+        exe_suffix=".exe"
+    fi
+    [[ -f "$release_dir/bin/clang$exe_suffix" ]] || {
+        echo "Error: clang$exe_suffix is missing; cannot install driver aliases" >&2
+        return 1
+    }
+
+    # Espressif's Xtensa driver runs an external integrated assembler selected
+    # from the CPU name. These aliases are required on every host, not only on
+    # Windows: ESP32 uses xtensa-esp32-elf-clang-as and ESP8266 uses
+    # xtensa-esp8266-elf-clang-as. Keep clang-as too for the generic driver
+    # contract.
+    for alias in \
+        clang-as \
+        xtensa-esp32-elf-clang-as \
+        xtensa-esp8266-elf-clang-as; do
+        rm -f "$release_dir/bin/$alias$exe_suffix"
+        if [[ -n "$exe_suffix" ]]; then
+            # CPack drops Windows symlinks. Regular PE aliases survive archive
+            # creation and native Windows extraction reliably.
+            cp "$release_dir/bin/clang.exe" "$release_dir/bin/$alias.exe"
+        else
+            ln -s clang "$release_dir/bin/$alias"
+        fi
+    done
 }
 
 write_payload_manifest() {
@@ -374,14 +455,16 @@ validate_release() {
         exe_suffix=".exe"
     fi
 
-    local required_tools=(clang clang++ ld.lld lld llvm-ar llvm-config llvm-nm llc opt)
-    if [[ "$target" == *-w64-mingw32 ]]; then
-        required_tools+=(
-            clang-as
-            xtensa-esp32-elf-clang-as
-            xtensa-esp8266-elf-clang-as
-        )
-    fi
+    # Keep this list aligned with LLGo's actual embedded build, archive,
+    # inspection, size-report, and release-smoke consumers. The payload may
+    # contain additional LLVM utilities, but these are its supported contract.
+    local required_tools=(
+        clang clang++ clang-as
+        xtensa-esp32-elf-clang-as xtensa-esp8266-elf-clang-as
+        ld.lld lld llc opt
+        llvm-ar llvm-config llvm-nm llvm-objcopy llvm-objdump llvm-ranlib
+        llvm-readelf llvm-readobj llvm-size llvm-strip
+    )
     for tool in "${required_tools[@]}"; do
         if [[ ! -x "$release_dir/bin/$tool$exe_suffix" ]]; then
             echo "Error: required tool $tool is missing from $release_dir/bin" >&2
@@ -394,7 +477,10 @@ validate_release() {
         echo "Error: llvm-config reports $actual_version, expected $LLVM_EXPECTED_VERSION.x" >&2
         return 1
     fi
-    for tool in opt ld.lld; do
+    for tool in \
+        clang clang++ clang-as ld.lld llc opt \
+        llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-ranlib \
+        llvm-readelf llvm-readobj llvm-size llvm-strip; do
         tool_version="$("$release_dir/bin/$tool$exe_suffix" --version)"
         if [[ "$tool_version" != *"$LLVM_EXPECTED_VERSION"* ]]; then
             echo "Error: $tool reports $tool_version, expected $LLVM_EXPECTED_VERSION.x" >&2
@@ -475,6 +561,30 @@ EOF
         return 1
     fi
 
+    if [[ "$target" != *-w64-mingw32 ]]; then
+        cat > "$test_dir/llvm-c-sdk.c" << EOF
+#include <llvm-c/Core.h>
+int main(void) {
+  unsigned major = 0, minor = 0, patch = 0;
+  LLVMGetVersion(&major, &minor, &patch);
+  return major == $LLVM_EXPECTED_MAJOR ? 0 : 1;
+}
+EOF
+        if ! "$release_dir/bin/clang" \
+                -I"$release_dir/include" "$test_dir/llvm-c-sdk.c" \
+                -L"$release_dir/lib" "-Wl,-rpath,$release_dir/lib" \
+                "-lLLVM-$LLVM_EXPECTED_MAJOR" \
+                -o "$test_dir/llvm-c-sdk" ||
+           ! env \
+                DYLD_LIBRARY_PATH="$release_dir/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
+                LD_LIBRARY_PATH="$release_dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+                "$test_dir/llvm-c-sdk"; then
+            rm -rf "$test_dir"
+            echo "Error: packaged LLVM C SDK failed to compile, link, or run" >&2
+            return 1
+        fi
+    fi
+
     cat > "$test_dir/schedule-region.S" << 'EOF'
         .text
         .begin schedule
@@ -503,7 +613,8 @@ EOF
        ! "$release_dir/bin/clang$exe_suffix" --target=xtensa-esp-unknown-elf \
         -mcpu=esp8266 -Werror -ffreestanding -c "$test_dir/codegen.c" -o "$test_dir/esp8266.o" ||
        ! "$release_dir/bin/clang$exe_suffix" --target=riscv32-esp-unknown-elf \
-        -mcpu=generic-rv32 -Werror -ffreestanding -c "$test_dir/codegen.c" -o "$test_dir/esp32c3.o"; then
+        -mcpu=generic-rv32 -Werror -g -ffreestanding -c \
+        "$test_dir/codegen.c" -o "$test_dir/esp32c3.o"; then
         rm -rf "$test_dir"
         echo "Error: ESP32, ESP8266, or ESP32-C3 code generation failed" >&2
         return 1
@@ -516,6 +627,46 @@ EOF
         "$test_dir/esp32c3.o" -o "$test_dir/esp32c3-linked.o"; then
         rm -rf "$test_dir"
         echo "Error: ESP32, ESP8266, or ESP32-C3 relocatable link failed" >&2
+        return 1
+    fi
+
+    # Exercise the rest of LLGo's payload tool contract against a real ESP32-C3
+    # object instead of merely checking filenames in the archive.
+    if ! "$release_dir/bin/llvm-ar$exe_suffix" rcs \
+            "$test_dir/libesp32c3-smoke.a" "$test_dir/esp32c3.o" ||
+       ! "$release_dir/bin/llvm-ranlib$exe_suffix" \
+            "$test_dir/libesp32c3-smoke.a" ||
+       ! "$release_dir/bin/llvm-ar$exe_suffix" t \
+            "$test_dir/libesp32c3-smoke.a" | grep -q 'esp32c3.o' ||
+       ! "$release_dir/bin/llvm-nm$exe_suffix" --defined-only \
+            "$test_dir/esp32c3.o" | grep -q 'llgo_esp_codegen_smoke' ||
+       ! "$release_dir/bin/llvm-objdump$exe_suffix" --section-headers \
+            "$test_dir/esp32c3.o" >/dev/null ||
+       ! "$release_dir/bin/llvm-readelf$exe_suffix" --file-header \
+            "$test_dir/esp32c3.o" >/dev/null ||
+       ! "$release_dir/bin/llvm-readobj$exe_suffix" --file-headers \
+            "$test_dir/esp32c3.o" >/dev/null ||
+       ! "$release_dir/bin/llvm-size$exe_suffix" \
+            "$test_dir/esp32c3.o" >/dev/null ||
+       ! "$release_dir/bin/llvm-objcopy$exe_suffix" --strip-debug \
+            "$test_dir/esp32c3.o" "$test_dir/esp32c3-objcopy.o" ||
+       ! "$release_dir/bin/llvm-strip$exe_suffix" --strip-debug \
+            -o "$test_dir/esp32c3-strip.o" "$test_dir/esp32c3.o"; then
+        rm -rf "$test_dir"
+        echo "Error: an LLVM archive or object-inspection payload tool failed" >&2
+        return 1
+    fi
+
+    # lld performs the LTO plugin work in-process. This proves that the
+    # packaged Clang can emit LLVM bitcode and the packaged linker can load and
+    # lower it for an Espressif target.
+    if ! "$release_dir/bin/clang$exe_suffix" --target=riscv32-esp-unknown-elf \
+            -mcpu=generic-rv32 -Werror -ffreestanding -flto -c \
+            "$test_dir/codegen.c" -o "$test_dir/esp32c3-lto.o" ||
+       ! "$release_dir/bin/ld.lld$exe_suffix" -r \
+            "$test_dir/esp32c3-lto.o" -o "$test_dir/esp32c3-lto-linked.o"; then
+        rm -rf "$test_dir"
+        echo "Error: ESP32-C3 LTO compile or plugin-backed link failed" >&2
         return 1
     fi
     for object in \
@@ -555,6 +706,7 @@ build_windows_platform() {
     local install_dir="$SCRIPT_DIR/install/$target"
     local release_dir="$build_dir/unpack/esp-clang"
     local scripts_dir
+    local ccache_args=()
 
     if ! command -v x86_64-w64-mingw32-clang >/dev/null 2>&1 ||
        ! command -v x86_64-w64-mingw32-clang++ >/dev/null 2>&1; then
@@ -562,9 +714,13 @@ build_windows_platform() {
         return 1
     fi
     scripts_dir="$(download_build_scripts)"
+    while IFS= read -r arg; do
+        ccache_args+=("$arg")
+    done < <(get_ccache_cmake_args)
 
     mkdir -p "$build_dir" "$install_dir"
     cmake -S "$scripts_dir" -B "$build_dir" -G Ninja \
+        "${ccache_args[@]}" \
         -DFETCHCONTENT_SOURCE_DIR_LLVMPROJECT="$LLVM_PROJECTDIR" \
         -DFETCHCONTENT_QUIET=OFF \
         -DLLVM_TOOLCHAIN_C_LIBRARY=none \
@@ -581,6 +737,7 @@ build_windows_platform() {
         -DCLANG_REPOSITORY_STRING=https://github.com/espressif/llvm-project.git \
         -DCPACK_ARCHIVE_THREADS=0 \
         -DCMAKE_INSTALL_PREFIX="$install_dir"
+    validate_ccache_configuration "$build_dir"
 
     cmake --build "$build_dir" --target package-llvm-toolchain -j"$(get_cpu_cores)"
     cmake --build "$build_dir" --target unpack-llvm-toolchain
@@ -589,17 +746,7 @@ build_windows_platform() {
         return 1
     fi
 
-    # The pinned Espressif packaging script removes unlisted Windows symlinks.
-    # Its Xtensa driver does not execute the generic clang-as name: it derives
-    # a CPU-specific program name such as xtensa-esp32-elf-clang-as. Preserve
-    # every alias used by LLGo as a regular PE executable.
-    local clang_as_alias
-    for clang_as_alias in \
-        clang-as \
-        xtensa-esp32-elf-clang-as \
-        xtensa-esp8266-elf-clang-as; do
-        cp "$release_dir/bin/clang.exe" "$release_dir/bin/$clang_as_alias.exe"
-    done
+    install_clang_driver_aliases "$release_dir" "$target"
 
     # This executable-only payload deliberately builds no target runtime
     # variants. The build scripts nevertheless install an empty multilib.yaml,
@@ -615,7 +762,9 @@ build_windows_platform() {
     for tool in \
         clang clang++ clang-as \
         xtensa-esp32-elf-clang-as xtensa-esp8266-elf-clang-as \
-        ld.lld lld llvm-ar llvm-config llvm-nm llc opt; do
+        ld.lld lld llc opt \
+        llvm-ar llvm-config llvm-nm llvm-objcopy llvm-objdump llvm-ranlib \
+        llvm-readelf llvm-readobj llvm-size llvm-strip; do
         [[ -f "$release_dir/bin/$tool.exe" ]] || {
             echo "Error: required Windows tool $tool.exe is missing" >&2
             return 1
@@ -686,6 +835,7 @@ build_platform() {
     done < <({
         get_base_cmake_args
         get_platform_cmake_args "$target"
+        get_ccache_cmake_args
         echo "-DCMAKE_INSTALL_PREFIX=$install_dir"
     })
 
@@ -697,6 +847,7 @@ build_platform() {
     echo "Configuring build for $target..."
     cd "$build_dir"
     cmake "$LLVM_PROJECTDIR/llvm" "${cmake_args[@]}"
+    validate_ccache_configuration "$build_dir"
 
     # Build
     echo "Building $target..."
@@ -769,6 +920,8 @@ main() {
         echo "Error: git is required but not installed"
         exit 1
     fi
+
+    setup_ccache
 
     # Download LLVM source
     download_llvm_source
