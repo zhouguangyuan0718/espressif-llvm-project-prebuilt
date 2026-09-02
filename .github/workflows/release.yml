@@ -152,9 +152,10 @@ jobs:
     # publishes the trusted cache that a tag build may restore. Tag builds use
     # restore-only so they do not spend repository cache quota on tag-scoped
     # entries that future releases cannot reuse.
-    - name: Restore and save ccache
+    - name: Restore ccache
+      id: ccache-restore
       if: github.ref_type != 'tag'
-      uses: actions/cache@v5
+      uses: actions/cache/restore@v5
       with:
         path: ${{ env.CCACHE_DIR }}
         key: esp-llvm-ccache-v1-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('toolchain.env', 'release.sh', '.github/workflows/release.yml', 'patches/**') }}
@@ -226,6 +227,7 @@ jobs:
         echo "$root/bin" >> "$GITHUB_PATH"
 
     - name: Build esp-clang package
+      id: build
       shell: bash
       env:
         TAG: ${{ needs.prepare.outputs.tag }}
@@ -241,6 +243,13 @@ jobs:
           ccache --show-stats
           du -sh "$CCACHE_DIR" || true
         fi
+
+    - name: Save ccache
+      if: ${{ !cancelled() && github.ref_type != 'tag' && steps.build.outcome != 'skipped' && steps.ccache-restore.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@v5
+      with:
+        path: ${{ env.CCACHE_DIR }}
+        key: esp-llvm-ccache-v1-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('toolchain.env', 'release.sh', '.github/workflows/release.yml', 'patches/**') }}
 
     - name: List generated packages
       shell: bash
